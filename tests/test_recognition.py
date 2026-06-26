@@ -1,0 +1,216 @@
+"""Contract and pinned-artifact checks for the first recognition backends."""
+
+import wave
+from typing import cast
+from pathlib import Path
+
+import pytest
+
+from lumivox_sttlab.tone import Tone, ToneRun
+from lumivox_sttlab.gigaam import Gigaam
+from lumivox_sttlab.recognition import Recognizer, RunOutcome, Transcript, RecognitionRun, feed_pcm
+
+DATA = Path(__file__).resolve().parents[1] / "data"
+
+
+class _FakeAsr:
+    def recognize(self, audio: object, *, sample_rate: int) -> str:
+        assert sample_rate == 16_000
+        return "sample"
+
+
+def test_batch_run_boundaries_and_empty_input() -> None:
+    runtime = object.__new__(Gigaam)
+    runtime._asr = _FakeAsr()  # type: ignore[assignment]
+    backend: Recognizer = runtime
+    first: RecognitionRun = backend.new_run(max_samples=2)
+    assert backend.new_run(max_samples=1).outcome is None
+    assert first.feed(b"\x00\x01") == ()
+    assert first.feed(b"\x00\x01") == ()
+    result = first.finish()
+    assert first.outcome is RunOutcome.FINISHED
+    assert [(item.text, item.revision, item.sample_end, item.final) for item in result] == [("sample", 1, 2, True)]
+    with pytest.raises(RuntimeError):
+        first.feed(b"")
+
+    second = backend.new_run(max_samples=2)
+    assert second.finish()[0].text == ""
+    interrupted = backend.new_run(max_samples=2)
+    interrupted.feed(b"\x00\x00")
+    interrupted.abort()
+    assert interrupted.outcome is RunOutcome.ABORTED
+    with pytest.raises(RuntimeError):
+        interrupted.finish()
+    overflow = backend.new_run(max_samples=1)
+    with pytest.raises(OverflowError):
+        overflow.feed(b"\0\0\0\0")
+    assert overflow.outcome is RunOutcome.OVERFLOW
+    with pytest.raises(RuntimeError):
+        overflow.finish()
+    with pytest.raises(ValueError):
+        backend.new_run(max_samples=0)
+    with pytest.raises(ValueError):
+        backend.new_run(max_samples=True)
+    with pytest.raises(ValueError):
+        backend.new_run(max_samples=2).feed(b"\0")
+    labeled = backend.new_run(max_samples=2)
+    with pytest.raises(ValueError):
+        labeled.feed(b"\0\0", speech=1)  # type: ignore[arg-type]
+    assert labeled.feed(b"\0\0", speech=False) == ()
+    assert labeled.feed(b"", speech=False) == ()  # a paused producer supplies no audio time
+    assert labeled.feed(b"\0\0", speech=True) == ()
+    assert labeled.finish()[0].sample_end == 2
+
+
+def test_batch_failure_releases_audio_and_keeps_original_exception() -> None:
+    class BrokenAsr:
+        def recognize(self, audio: object, *, sample_rate: int) -> str:
+            raise LookupError("inference failed")
+
+    runtime = object.__new__(Gigaam)
+    runtime._asr = BrokenAsr()  # type: ignore[assignment]
+    failed = runtime.new_run(max_samples=3)
+    failed.feed(b"\0\0")
+    with pytest.raises(LookupError, match="inference failed"):
+        failed.finish()
+    assert failed.outcome is RunOutcome.FAILED
+    assert failed._chunks == []
+    with pytest.raises(RuntimeError):
+        failed.feed(b"")
+    with pytest.raises(RuntimeError):
+        failed.abort()
+    assert failed.outcome is RunOutcome.FAILED
+
+    surviving = runtime.new_run(max_samples=1)
+    assert surviving.finish()[0].final
+    assert surviving.outcome is RunOutcome.FINISHED
+
+
+def test_tone_feed_and_flush_failures_release_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = object.__new__(Tone)
+    run = ToneRun(runtime, 10)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise LookupError("native inference failed")
+
+    monkeypatch.setattr(run, "_window", fail)
+    with pytest.raises(LookupError, match="native inference failed"):
+        run.feed(b"\0\0")
+    assert run.outcome is RunOutcome.FAILED
+    assert len(run._pcm) == 0 and len(run._past) == 0 and len(run._state) == 0
+    with pytest.raises(RuntimeError):
+        run.finish()
+
+    flush = ToneRun(runtime, 10)
+
+    def consume_window(*, is_last: bool) -> list[Transcript]:
+        flush._pcm = flush._pcm[2400:]
+        return []
+
+    monkeypatch.setattr(flush, "_window", consume_window)
+    flush.feed(b"\0\0")
+    monkeypatch.setattr(flush, "_window", fail)
+    with pytest.raises(LookupError, match="native inference failed"):
+        flush.finish()
+    assert flush.outcome is RunOutcome.FAILED
+    assert len(flush._pcm) == 0 and len(flush._state) == 0
+
+
+def test_feed_pcm_chunks_without_vad_and_leaves_finalization_to_caller() -> None:
+    class Run:
+        def __init__(self) -> None:
+            self.chunks: list[tuple[bytes, bool]] = []
+            self.outcome: RunOutcome | None = None
+
+        def feed(self, pcm: bytes, *, speech: bool = True) -> tuple[Transcript, ...]:
+            self.chunks.append((pcm, speech))
+            return (
+                Transcript(str(len(self.chunks)), len(self.chunks), sum(len(c) // 2 for c, _ in self.chunks), False),
+            )
+
+        def finish(self) -> tuple[Transcript, ...]:
+            return (Transcript("final", len(self.chunks) + 1, sum(len(c) // 2 for c, _ in self.chunks), True),)
+
+        def abort(self) -> None:
+            pass
+
+    run = Run()
+    assert feed_pcm(run, b"") == ()
+    pcm = b"\0\0\1\0\2\0\3\0\4\0"
+    updates = feed_pcm(run, pcm, chunk_samples=2)
+    assert run.chunks == [(pcm[:4], True), (pcm[4:8], True), (pcm[8:], True)]
+    assert [update.sample_end for update in updates] == [2, 4, 5]
+    assert run.finish()[0].final
+    for invalid in (b"\0", bytearray(b"\0\0")):
+        with pytest.raises(ValueError):
+            feed_pcm(run, invalid)  # type: ignore[arg-type]
+    for size in (0, -1, True):
+        with pytest.raises(ValueError):
+            feed_pcm(run, pcm, chunk_samples=size)
+    assert len(run.chunks) == 3
+
+
+def _pcm(path: Path) -> bytes:
+    with wave.open(str(path)) as source:
+        assert source.getnchannels() == 1 and source.getframerate() == 16000
+        return cast(bytes, source.readframes(source.getnframes()))
+
+
+@pytest.mark.model
+def test_gigaam_batch_russian_and_english() -> None:
+    if not (DATA / "gigaam/v3/v3_ctc.int8.onnx").exists():
+        pytest.skip("pinned model missing under data/gigaam")
+    russian = _pcm(DATA / "gigaam/example.wav")
+    ctc = Gigaam("gigaam-v3-ctc", DATA / "gigaam/v3", quantization="int8")
+    run = ctc.new_run(max_samples=len(russian) // 2)
+    for offset in range(0, len(russian), 1994):
+        assert not run.feed(russian[offset : offset + 1994])
+    assert run.finish()[0].text.startswith("ничьих не требуя похвал")
+    if (DATA / "gigaam/v3/v3_e2e_rnnt_encoder.int8.onnx").exists():
+        rnnt = Gigaam("gigaam-v3-e2e-rnnt", DATA / "gigaam/v3", quantization="int8")
+        second_run = rnnt.new_run(max_samples=len(russian) // 2)
+        second_run.feed(russian)
+        assert second_run.finish()[0].text == (
+            "Ничьих не требуя похвал, Счастлив уж я надеждой сладкой, "
+            "Что дева с трепетом любви Посмотрит, может быть, украдкой "
+            "На песни грешные мои. У лукоморья дуб зелёный."
+        )
+    if (DATA / "gigaam/jfk.wav").exists() and (DATA / "gigaam/multilingual/multilingual_ctc.int8.onnx").exists():
+        english = _pcm(DATA / "gigaam/jfk.wav")
+        multi = Gigaam("gigaam-multilingual-ctc", DATA / "gigaam/multilingual", quantization="int8")
+        second = multi.new_run(max_samples=len(english) // 2)
+        second.feed(english)
+        assert "ask not what your country can do for you" in second.finish()[0].text
+
+
+@pytest.mark.model
+def test_tone_interleaved_runs_and_eof() -> None:
+    if not (DATA / "tone/model.onnx").exists() or not (DATA / "tone/audio_short_16k.wav").exists():
+        pytest.skip("pinned T-one model/sample missing under data/tone")
+    audio = _pcm(DATA / "tone/audio_short_16k.wav")
+    runtime: Recognizer = Tone(DATA / "tone/model.onnx")
+    a, b = (runtime.new_run(max_samples=len(audio) // 2) for _ in range(2))
+    events_a: list[Transcript] = []
+    events_b: list[Transcript] = []
+    for offset in range(0, len(audio), 1994):
+        chunk = audio[offset : offset + 1994]
+        events_a.extend(a.feed(chunk))
+        events_b.extend(b.feed(chunk))
+    events_a.extend(a.finish())
+    events_b.extend(b.finish())
+    assert events_a == events_b
+    assert events_a[-1].text == "ну сейчас к тебе приедет бригада давай давай я жду"
+    assert events_a[-1].final
+    phrases = [(e.phrase_start, e.phrase_end) for e in events_a if e.phrase_start is not None]
+    assert len(phrases) == 2
+    for observed, reference in zip(phrases, [(0.03, 2.91), (5.76, 6.21)], strict=True):
+        assert observed[0] == pytest.approx(reference[0], abs=0.031)
+        assert observed[1] == pytest.approx(reference[1], abs=0.031)
+    with pytest.raises(RuntimeError):
+        a.feed(b"")
+    interrupted = runtime.new_run(max_samples=len(audio) // 2)
+    interrupted.feed(audio[:1994])
+    interrupted.abort()
+    with pytest.raises(RuntimeError):
+        interrupted.finish()
+    assert runtime.new_run(max_samples=1).finish()[0].text == ""
