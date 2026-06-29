@@ -7,10 +7,12 @@ It does not emit unfinished within-phrase partial text or require KenLM/pyctcdec
 
 from pathlib import Path
 from itertools import groupby
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
 
+from ._providers import DEFAULT_PROVIDERS, load_with_providers
 from .recognition import Transcript, _RunBase
 
 _LABELS = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя "
@@ -20,27 +22,32 @@ _WINDOW = 2400  # 300 ms at 8 kHz
 class Tone:
     """Reusable T-one acoustic ONNX session; mutable state belongs to each run."""
 
-    def __init__(self, path: str | Path, *, provider: str = "CPUExecutionProvider") -> None:
+    def __init__(self, path: str | Path, *, providers: Sequence[str] = DEFAULT_PROVIDERS) -> None:
         import onnxruntime as ort
 
-        if provider not in ort.get_available_providers():
-            raise ValueError(f"unavailable ONNX provider: {provider}")
         model = Path(path)
         if not model.is_file():
             raise FileNotFoundError(model)
-        self._session = ort.InferenceSession(str(model), providers=[provider])
-        expected_inputs = {"signal": ("tensor(int32)", [1, 2400, 1]), "state": ("tensor(float16)", [1, 219729])}
-        expected_outputs = {"logprobs": ("tensor(float)", [10, 35]), "state_next": ("tensor(float16)", [219729])}
-        for inp in self._session.get_inputs():
-            if inp.name not in expected_inputs:
-                raise ValueError(f"unexpected T-one input: {inp.name}")
-            dtype, shape = expected_inputs[inp.name]
-            if inp.type != dtype or inp.shape[1:] != shape[1:]:
-                raise ValueError(f"incompatible T-one input: {inp.name}")
-        if {inp.name for inp in self._session.get_inputs()} != set(expected_inputs):
-            raise ValueError("incomplete T-one input contract")
-        if {out.name: (out.type, out.shape[1:]) for out in self._session.get_outputs()} != expected_outputs:
-            raise ValueError("incompatible T-one output contract")
+
+        def load(provider: str) -> ort.InferenceSession:
+            session = ort.InferenceSession(str(model), providers=[provider])
+            if provider not in session.get_providers():
+                raise RuntimeError(f"ONNX Runtime fell back from {provider}")
+            expected_inputs = {"signal": ("tensor(int32)", [1, 2400, 1]), "state": ("tensor(float16)", [1, 219729])}
+            expected_outputs = {"logprobs": ("tensor(float)", [10, 35]), "state_next": ("tensor(float16)", [219729])}
+            for inp in session.get_inputs():
+                if inp.name not in expected_inputs:
+                    raise ValueError(f"unexpected T-one input: {inp.name}")
+                dtype, shape = expected_inputs[inp.name]
+                if inp.type != dtype or inp.shape[1:] != shape[1:]:
+                    raise ValueError(f"incompatible T-one input: {inp.name}")
+            if {inp.name for inp in session.get_inputs()} != set(expected_inputs):
+                raise ValueError("incomplete T-one input contract")
+            if {out.name: (out.type, out.shape[1:]) for out in session.get_outputs()} != expected_outputs:
+                raise ValueError("incompatible T-one output contract")
+            return session
+
+        self._session, self.provider = load_with_providers(providers, ort.get_available_providers(), load)
 
     def new_run(self, *, max_samples: int) -> "ToneRun":
         """Allocate fresh resampler, acoustic state and phrase splitter state."""

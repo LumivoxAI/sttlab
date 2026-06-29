@@ -6,7 +6,7 @@ default:
 # Create or synchronize the complete local development environment.
 postclone:
     uv venv --python /usr/bin/python3 --system-site-packages
-    uv sync --python /usr/bin/python3 --all-groups --all-extras
+    uv sync --python /usr/bin/python3 --all-groups --extra tone --extra gigaam --extra cpu
 
 # Synchronize the default project and development dependencies.
 sync:
@@ -36,7 +36,7 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest
+    uv run --extra tone --extra gigaam --extra cpu pytest
 
 # Build artifacts without local uv source overrides.
 build:

@@ -1,16 +1,97 @@
 """Contract and pinned-artifact checks for the first recognition backends."""
 
 import wave
+from types import SimpleNamespace
 from typing import cast
 from pathlib import Path
 
 import pytest
+import onnxruntime as ort
 
 from lumivox_sttlab.tone import Tone, ToneRun
 from lumivox_sttlab.gigaam import Gigaam
+from lumivox_sttlab._providers import DEFAULT_PROVIDERS, load_with_providers
 from lumivox_sttlab.recognition import Recognizer, RunOutcome, Transcript, RecognitionRun, feed_pcm
 
 DATA = Path(__file__).resolve().parents[1] / "data"
+
+
+def test_provider_preference_and_initialization_fallback() -> None:
+    attempts: list[str] = []
+
+    def load(name: str) -> str:
+        attempts.append(name)
+        if name == "CUDAExecutionProvider":
+            raise RuntimeError("CUDA libraries missing")
+        return name
+
+    cpu = "CPUExecutionProvider"
+    cuda = "CUDAExecutionProvider"
+    assert load_with_providers(DEFAULT_PROVIDERS, [cpu], load) == (cpu, cpu)
+    assert attempts == [cpu]
+    attempts.clear()
+    assert load_with_providers([cuda, cpu], [cpu, cuda], load) == (cpu, cpu)
+    assert attempts == [cuda, cpu]
+    attempts.clear()
+    assert load_with_providers([cpu, cuda], [cpu, cuda], load) == (cpu, cpu)
+    assert attempts == [cpu]
+    with pytest.raises(RuntimeError, match="could not initialize") as error:
+        load_with_providers([cuda], [cuda, cpu], load)
+    assert isinstance(error.value.__cause__, RuntimeError)
+    with pytest.raises(ValueError, match="no requested ONNX provider"):
+        load_with_providers([cuda], [cpu], load)
+    with pytest.raises(ValueError, match="non-empty"):
+        load_with_providers([], [cpu], load)
+
+
+def test_tone_retries_when_onnx_runtime_silently_falls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    model = tmp_path / "tone.onnx"
+    model.touch()
+    attempts: list[str] = []
+
+    class Session:
+        def __init__(self, path: str, *, providers: list[str]) -> None:
+            assert path == str(model)
+            attempts.extend(providers)
+            self.provider = providers[0]
+
+        def get_providers(self) -> list[str]:
+            return ["CPUExecutionProvider"]
+
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(name="signal", type="tensor(int32)", shape=[1, 2400, 1]),
+                SimpleNamespace(name="state", type="tensor(float16)", shape=[1, 219729]),
+            ]
+
+        def get_outputs(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(name="logprobs", type="tensor(float)", shape=[1, 10, 35]),
+                SimpleNamespace(name="state_next", type="tensor(float16)", shape=[1, 219729]),
+            ]
+
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(ort, "InferenceSession", Session)
+    runtime = Tone(model)
+    assert attempts == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert runtime.provider == "CPUExecutionProvider"
+
+
+def test_gigaam_retries_when_acoustic_session_falls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import onnx_asr
+
+    attempts: list[str] = []
+
+    def load_model(*args: object, providers: list[str], **kwargs: object) -> SimpleNamespace:
+        attempts.extend(providers)
+        session = SimpleNamespace(get_providers=lambda: ["CPUExecutionProvider"])
+        return SimpleNamespace(asr=SimpleNamespace(_model=session))
+
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(onnx_asr, "load_model", load_model)
+    runtime = Gigaam("gigaam-v3-ctc", tmp_path)
+    assert attempts == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert runtime.provider == "CPUExecutionProvider"
 
 
 class _FakeAsr:
@@ -162,6 +243,7 @@ def test_gigaam_batch_russian_and_english() -> None:
         pytest.skip("pinned model missing under data/gigaam")
     russian = _pcm(DATA / "gigaam/example.wav")
     ctc = Gigaam("gigaam-v3-ctc", DATA / "gigaam/v3", quantization="int8")
+    assert ctc.provider == "CPUExecutionProvider"
     run = ctc.new_run(max_samples=len(russian) // 2)
     for offset in range(0, len(russian), 1994):
         assert not run.feed(russian[offset : offset + 1994])
@@ -188,7 +270,8 @@ def test_tone_interleaved_runs_and_eof() -> None:
     if not (DATA / "tone/model.onnx").exists() or not (DATA / "tone/audio_short_16k.wav").exists():
         pytest.skip("pinned T-one model/sample missing under data/tone")
     audio = _pcm(DATA / "tone/audio_short_16k.wav")
-    runtime: Recognizer = Tone(DATA / "tone/model.onnx")
+    runtime = Tone(DATA / "tone/model.onnx")
+    assert runtime.provider == "CPUExecutionProvider"
     a, b = (runtime.new_run(max_samples=len(audio) // 2) for _ in range(2))
     events_a: list[Transcript] = []
     events_b: list[Transcript] = []

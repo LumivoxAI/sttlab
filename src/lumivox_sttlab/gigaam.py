@@ -1,9 +1,11 @@
 """Bounded batch GigaAM through onnx-asr; no upstream GigaAM import."""
 
 from pathlib import Path
+from collections.abc import Sequence
 
 import numpy as np
 
+from ._providers import DEFAULT_PROVIDERS, load_with_providers
 from .recognition import Transcript, _RunBase
 
 _MODELS = frozenset(
@@ -22,7 +24,7 @@ class Gigaam:
     """Loaded batch recognizer. No network access or automatic model downloads.
 
     Install the ``gigaam`` extra, provide an onnx-asr compatible model directory,
-    and select the CPU or CUDA execution provider explicitly. An ONNX session may
+    and prefer CUDA before CPU unless a different provider order is supplied. An ONNX session may
     be shared by independent runs; entry points block the calling thread.
     """
 
@@ -32,7 +34,7 @@ class Gigaam:
         path: str | Path,
         *,
         quantization: str | None = None,
-        provider: str = "CPUExecutionProvider",
+        providers: Sequence[str] = DEFAULT_PROVIDERS,
     ) -> None:
         if model not in _MODELS:
             raise ValueError(f"unsupported GigaAM model: {model}")
@@ -41,11 +43,22 @@ class Gigaam:
             raise FileNotFoundError(directory)
         import onnx_asr
         import onnxruntime as ort
+        from onnx_asr.adapters import TextResultsAsrAdapter
 
-        if provider not in ort.get_available_providers():
-            raise ValueError(f"unavailable ONNX provider: {provider}")
+        def load(provider: str) -> TextResultsAsrAdapter:
+            asr = onnx_asr.load_model(model, directory, quantization=quantization, providers=[provider])
+            acoustic = asr.asr
+            sessions = (
+                [getattr(acoustic, "_model")]
+                if hasattr(acoustic, "_model")
+                else [getattr(acoustic, name) for name in ("_encoder", "_decoder", "_joiner")]
+            )
+            if any(provider not in session.get_providers() for session in sessions):
+                raise RuntimeError(f"ONNX Runtime fell back from {provider}")
+            return asr
+
         self.model = model
-        self._asr = onnx_asr.load_model(model, directory, quantization=quantization, providers=[provider])
+        self._asr, self.provider = load_with_providers(providers, ort.get_available_providers(), load)
 
     def new_run(self, *, max_samples: int) -> "GigaamRun":
         """Allocate a run; max_samples bounds retained PCM until final inference."""
