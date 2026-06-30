@@ -11,9 +11,78 @@ import onnxruntime as ort
 from lumivox_sttlab.tone import Tone, ToneRun
 from lumivox_sttlab.gigaam import Gigaam
 from lumivox_sttlab._providers import DEFAULT_PROVIDERS, load_with_providers
-from lumivox_sttlab.recognition import Recognizer, RunOutcome, Transcript, RecognitionRun, feed_pcm
+from lumivox_sttlab.recognition import (
+    Recognizer,
+    RunOutcome,
+    Transcript,
+    RecognitionRun,
+    IntermediateOutput,
+    RecognitionCapabilities,
+    _RunBase,
+    feed_pcm,
+)
 
 DATA = Path(__file__).resolve().parents[1] / "data"
+
+
+def test_recognizer_capabilities_reject_incompatible_requirements() -> None:
+    tone: Recognizer = object.__new__(Tone)
+    gigaam: Recognizer = object.__new__(Gigaam)
+    assert tone.capabilities.intermediate is IntermediateOutput.COMPLETED_PHRASES
+    assert not tone.capabilities.requires_complete_segment
+    assert gigaam.capabilities.intermediate is IntermediateOutput.NONE
+    assert gigaam.capabilities.requires_complete_segment
+    for backend in (tone, gigaam):
+        backend.capabilities.require()
+        assert backend.capabilities.final_flush
+    tone.capabilities.require(intermediate=IntermediateOutput.COMPLETED_PHRASES)
+    with pytest.raises(ValueError, match="completed_phrases"):
+        gigaam.capabilities.require(intermediate=IntermediateOutput.COMPLETED_PHRASES)
+    with pytest.raises(ValueError, match="revisable_partials"):
+        tone.capabilities.require(intermediate=IntermediateOutput.REVISABLE_PARTIALS)
+    with pytest.raises(ValueError, match="flush"):
+        RecognitionCapabilities(IntermediateOutput.NONE, True, False).require()
+
+
+def test_revisable_partial_recognizer_contract_on_uneven_chunks_and_eof() -> None:
+    class PartialRun(_RunBase):
+        def feed(self, pcm: bytes, *, speech: bool = True) -> tuple[Transcript, ...]:
+            self._accept(pcm, speech)
+            return (self._output("draft" if self.sample_end < 3 else "corrected", final=False),)
+
+        def finish(self) -> tuple[Transcript, ...]:
+            self._finish()
+            result = (self._output("corrected final", final=True),)
+            self._complete()
+            return result
+
+    class PartialRecognizer:
+        capabilities = RecognitionCapabilities(IntermediateOutput.REVISABLE_PARTIALS, False, True)
+
+        def new_run(self, *, max_samples: int) -> PartialRun:
+            return PartialRun(max_samples)
+
+    backend: Recognizer = PartialRecognizer()
+    backend.capabilities.require(intermediate=IntermediateOutput.REVISABLE_PARTIALS)
+    with pytest.raises(ValueError, match="completed_phrases"):
+        backend.capabilities.require(intermediate=IntermediateOutput.COMPLETED_PHRASES)
+    a, b = (backend.new_run(max_samples=3) for _ in range(2))
+    first = a.feed(b"\0\0")
+    assert b.feed(b"\0\0\0\0\0\0")[0].sample_end == 3
+    second = a.feed(b"\0\0\0\0")
+    tail = a.finish()
+    assert [(e.text, e.revision, e.sample_end, e.final) for e in first + second + tail] == [
+        ("draft", 1, 1, False),
+        ("corrected", 2, 3, False),
+        ("corrected final", 3, 3, True),
+    ]
+    assert b.finish()[0].revision == 2
+    assert a.outcome is b.outcome is RunOutcome.FINISHED
+    aborted = backend.new_run(max_samples=1)
+    aborted.abort()
+    assert aborted.outcome is RunOutcome.ABORTED
+    with pytest.raises(RuntimeError):
+        aborted.finish()
 
 
 def test_provider_preference_and_initialization_fallback() -> None:

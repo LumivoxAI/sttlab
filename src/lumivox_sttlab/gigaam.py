@@ -6,7 +6,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from ._providers import DEFAULT_PROVIDERS, load_with_providers
-from .recognition import Transcript, _RunBase
+from .recognition import Transcript, IntermediateOutput, RecognitionCapabilities, _RunBase
 
 _MODELS = frozenset(
     {
@@ -27,6 +27,10 @@ class Gigaam:
     and prefer CUDA before CPU unless a different provider order is supplied. An ONNX session may
     be shared by independent runs; entry points block the calling thread.
     """
+
+    capabilities = RecognitionCapabilities(
+        intermediate=IntermediateOutput.NONE, requires_complete_segment=True, final_flush=True
+    )
 
     def __init__(
         self,

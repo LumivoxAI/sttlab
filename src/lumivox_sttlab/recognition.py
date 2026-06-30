@@ -21,9 +21,44 @@ class RunOutcome(str, Enum):
     OVERFLOW = "overflow"
 
 
+class IntermediateOutput(str, Enum):
+    """Kind of text available before finish; these kinds are not interchangeable."""
+
+    NONE = "none"
+    COMPLETED_PHRASES = "completed_phrases"
+    REVISABLE_PARTIALS = "revisable_partials"
+
+
+@dataclass(frozen=True)
+class RecognitionCapabilities:
+    """Declared behavior of a loaded recognizer, independent of its model path."""
+
+    intermediate: IntermediateOutput
+    requires_complete_segment: bool
+    final_flush: bool
+
+    def require(self, *, intermediate: IntermediateOutput = IntermediateOutput.NONE, final_flush: bool = True) -> None:
+        """Reject a pipeline requirement the recognizer cannot fulfill.
+
+        NONE requests no early text; the other kinds require an exact match.
+        A revisable partial is not a guaranteed completed phrase, or vice versa.
+        """
+        if not isinstance(intermediate, IntermediateOutput):
+            raise ValueError("intermediate must be an IntermediateOutput")
+        if intermediate is not IntermediateOutput.NONE and self.intermediate is not intermediate:
+            raise ValueError(f"recognizer does not provide {intermediate.value}")
+        if final_flush and not self.final_flush:
+            raise ValueError("recognizer does not flush final audio")
+
+
 @dataclass(frozen=True)
 class Transcript:
-    """Complete text so far; T-one only publishes completed phrases."""
+    """Text snapshot for one recognizer run; revisions are local to that run.
+
+    Intermediate snapshots may revise earlier text if the recognizer declares
+    revisable partials. final=True means this recognizer has flushed at EOF,
+    not that a later, separate recognizer cannot produce another result.
+    """
 
     text: str
     revision: int
@@ -56,6 +91,11 @@ class RecognitionRun(Protocol):
 
 class Recognizer(Protocol):
     """Reusable loaded model; implementation owns its native audio conversion."""
+
+    @property
+    def capabilities(self) -> RecognitionCapabilities:
+        """Behavior a caller may require before creating or connecting a run."""
+        ...
 
     def new_run(self, *, max_samples: int) -> RecognitionRun:
         """Create a fresh run with a caller-chosen bound in 16-kHz samples."""

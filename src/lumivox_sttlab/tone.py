@@ -13,7 +13,7 @@ import numpy as np
 import numpy.typing as npt
 
 from ._providers import DEFAULT_PROVIDERS, load_with_providers
-from .recognition import Transcript, _RunBase
+from .recognition import Transcript, IntermediateOutput, RecognitionCapabilities, _RunBase
 
 _LABELS = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя "
 _WINDOW = 2400  # 300 ms at 8 kHz
@@ -21,6 +21,10 @@ _WINDOW = 2400  # 300 ms at 8 kHz
 
 class Tone:
     """Reusable T-one acoustic ONNX session; mutable state belongs to each run."""
+
+    capabilities = RecognitionCapabilities(
+        intermediate=IntermediateOutput.COMPLETED_PHRASES, requires_complete_segment=False, final_flush=True
+    )
 
     def __init__(self, path: str | Path, *, providers: Sequence[str] = DEFAULT_PROVIDERS) -> None:
         import onnxruntime as ort
